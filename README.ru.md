@@ -68,6 +68,38 @@ fn main() Net -> () {
 `user`/`pass` — `Option[str]`: передайте `None, None` для прокси без
 аутентификации.
 
+## Ограничение времени хендшейка
+
+У `socks5_connect` **нет встроенного таймаута** — вызывающему, которому
+нужен предел по времени, следует обернуть вызов в `supervised(timeout: …)`
+(общая идиома Nova для ограничения блокирующей операции `Net`):
+
+```nova
+with Fail[TimeoutError] = |_e| { /* handle the timeout */ } {
+    supervised(timeout: 5000.to_millis()) {
+        match socks5_connect("proxy.example.com", 1080, None, None, "example.com", 80) {
+            Ok(consume stream) => { /* use it */ }
+            Err(e) => { /* handshake failed within the deadline */ }
+        }
+    }
+}
+```
+
+**Известная оговорка, найденная в ходе ревью-аудита 2026-08-06 (в этом
+пакете НЕ исправлена):** тестирование на реальном loopback-соединении
+показало, что `timeout:` надёжно прерывает заблокированный
+`TcpListener.accept()` (это закреплено регрессионным тестом —
+`std/src/net/supervised_cancel_accept_test.nv`), но НЕ прерывал надёжно
+ВТОРОЙ вызов `TcpStream.read()` на соединении, где пир прислал часть
+протокольного поля и закрылся — ровно тот паттерн повтора, который
+использует внутренний `read_exact_n` у `socks5_connect`. Похоже на
+открытый вопрос `std.net`/рантайма, не исправимый со стороны этого
+пакета — минимальное репро:
+[`docs/plans/repro/p249_second_read_after_partial_hangs.nv`](https://github.com/nv-lang/nova/blob/main/docs/plans/repro/p249_second_read_after_partial_hangs.nv)
+в репе `nova`. Пока это не решено, прокси, который присылает обрезанное
+поле и затем замолкает (вместо аккуратного закрытия), может зависнуть за
+пределами вашего дедлайна `timeout:`.
+
 ## Устройство
 
 Каждое сообщение хендшейка (приветствие, выбор метода, запрос/ответ auth,

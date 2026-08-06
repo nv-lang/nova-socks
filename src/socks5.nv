@@ -36,6 +36,7 @@ export type SocksError enum ConnectFailed { reason str }
     | UnsupportedAddressType
     | GeneralFailure { code u8 }
     | Protocol { detail str }
+    | PortOutOfRange { port int }
 
 /// Human-readable description (no trailing newline).
 #stable(since = "0.1")
@@ -49,6 +50,7 @@ export fn SocksError @to_str() -> str {
         UnsupportedAddressType     => "SOCKS5 server returned an IPv6 (ATYP 0x04) address — not supported"
         GeneralFailure { code }    => "SOCKS5 CONNECT failed, server reply code ${code}"
         Protocol { detail }        => "SOCKS5 protocol error: ${detail}"
+        PortOutOfRange { port }    => "port ${port} is out of the valid 0..65535 range"
     }
 }
 
@@ -75,6 +77,18 @@ const ATYP_IPV6   u8 = 0x04
 const REP_SUCCEEDED u8 = 0x00
 
 const MAX_DOMAIN_LEN = 255
+
+// Validate a port is in the wire-representable range BEFORE it gets
+// truncated into 2 bytes / cast to `u16` — an out-of-range `int` (negative,
+// or >= 65536) would otherwise wrap SILENTLY (`70000 as u16` == 4464) and
+// put a syntactically-valid-but-WRONG port on the wire (found during the
+// audit-review pass, plan 249, coordinator 2026-08-06 — exactly the "silent
+// wrong result" class this whole audit exists to catch). Used for BOTH the
+// proxy port (`socks5_connect`) and the target port
+// (`encode_connect_request`) — same failure mode, same fix, one place.
+fn check_port(port int) -> Result[u16, SocksError] {
+    if port < 0 || port > 0xFFFF { Err(PortOutOfRange { port }) } else { Ok(port as u16) }
+}
 
 // ─────────────────────────────────────────────────────────────────────────
 // Pure encode/decode — method negotiation (RFC 1928 §3)
@@ -119,12 +133,16 @@ fn decode_method_selection(resp []u8, have_creds bool) -> Result[SelectedMethod,
 // ─────────────────────────────────────────────────────────────────────────
 
 /// Auth request: `VER(1)=0x01 ULEN(1) UNAME(ULEN) PLEN(1) PASSWD(PLEN)`.
+/// RFC 1929 §2: "the range of user name and password lengths is 1 to 255
+/// octets each" — empty username/password is OUT of that range (checked
+/// below), not just the upper bound (found missing during the audit-review
+/// pass, plan 249, coordinator 2026-08-06).
 fn encode_auth_request(user str, pass str) -> Result[[]u8, SocksError] {
-    if user.byte_len() > 255 {
-        return Err(Protocol { detail: "SOCKS5 auth username exceeds the 255-byte limit" })
+    if user.byte_len() < 1 || user.byte_len() > 255 {
+        return Err(Protocol { detail: "SOCKS5 auth username must be 1..255 bytes (RFC 1929 §2)" })
     }
-    if pass.byte_len() > 255 {
-        return Err(Protocol { detail: "SOCKS5 auth password exceeds the 255-byte limit" })
+    if pass.byte_len() < 1 || pass.byte_len() > 255 {
+        return Err(Protocol { detail: "SOCKS5 auth password must be 1..255 bytes (RFC 1929 §2)" })
     }
     Ok([]u8.new()
         .push(AUTH_VERSION)
@@ -134,10 +152,20 @@ fn encode_auth_request(user str, pass str) -> Result[[]u8, SocksError] {
         .append(pass.bytes()))
 }
 
-/// Auth reply: `VER(1) STATUS(1)`. `STATUS != 0x00` → failure.
+/// Auth reply: `VER(1) STATUS(1)`. `VER` here is the auth SUB-NEGOTIATION
+/// version (RFC 1929 §2 — `X'01'`, same wire constant as the request's own
+/// `VER`, NOT the SOCKS version `0x05`). `STATUS != 0x00` → failure.
+///
+/// Found missing during the audit-review pass (plan 249, coordinator
+/// 2026-08-06): the original cut this check, so a reply carrying the right
+/// length/STATUS but the WRONG sub-negotiation VER byte silently passed —
+/// exactly the "plausible-but-wrong input" class the audit exists to catch.
 fn decode_auth_reply(resp []u8) -> Result[(), SocksError] {
     if resp.len() != 2 {
         return Err(Protocol { detail: "auth reply must be exactly 2 bytes" })
+    }
+    if resp[0] != AUTH_VERSION {
+        return Err(Protocol { detail: "unexpected sub-negotiation version in auth reply" })
     }
     if resp[1] != AUTH_SUCCESS { return Err(AuthFailed) }
     Ok(())
@@ -158,6 +186,10 @@ fn decode_auth_reply(resp []u8) -> Result[(), SocksError] {
 /// through to the domain-name path, where the proxy's own resolver will
 /// fail them; this is a known V1 limitation, not a silent miscode.
 fn encode_connect_request(host str, port int) -> Result[[]u8, SocksError] {
+    ro port16 = match check_port(port) {
+        Ok(p)  => p
+        Err(e) => return Err(e)
+    }
     mut out []u8 = []u8.new()
     out.push(VERSION)
     out.push(CMD_CONNECT)
@@ -177,8 +209,8 @@ fn encode_connect_request(host str, port int) -> Result[[]u8, SocksError] {
             out.append(host.bytes())
         }
     }
-    out.push(((port >> 8) & 0xFF) as u8)
-    out.push((port & 0xFF) as u8)
+    out.push(((port16 >> 8) & 0xFF) as u8)
+    out.push((port16 & 0xFF) as u8)
     Ok(out)
 }
 
@@ -212,12 +244,20 @@ fn try_parse_ipv4(host str) -> Option[(u8, u8, u8, u8)] {
 /// Fixed 4-byte reply header: `VER(1) REP(1) RSV(1) ATYP(1)`. Returns
 /// `(REP, ATYP)` — the address+port tail is variable-length and handled
 /// separately (see [`classify_atyp`]).
+///
+/// `RSV` MUST be `0x00` (RFC 1928 §5) — checked for the same reason `VER`
+/// is checked at every step (found missing during the audit-review pass,
+/// plan 249, coordinator 2026-08-06): it was the one server-supplied byte
+/// in the whole reply that went unchecked.
 fn decode_reply_header(hdr []u8) -> Result[(u8, u8), SocksError] {
     if hdr.len() != 4 {
         return Err(Protocol { detail: "CONNECT reply header must be exactly 4 bytes" })
     }
     if hdr[0] != VERSION {
         return Err(Protocol { detail: "unexpected SOCKS version in CONNECT reply" })
+    }
+    if hdr[2] != RSV {
+        return Err(Protocol { detail: "non-zero RSV byte in CONNECT reply" })
     }
     Ok((hdr[1], hdr[3]))
 }
@@ -277,15 +317,39 @@ fn read_exact_n(mut stream TcpStream, n int) Net -> Result[[]u8, SocksError] {
 ///
 /// See the module doc for scope: CONNECT only, IPv4/domain targets
 /// (`Err(UnsupportedAddressType)` if the server's reply address is IPv6).
+///
+/// **No built-in timeout.** This function does not bound how long it can
+/// block — a caller who needs a time limit on the handshake should wrap the
+/// call in `supervised(timeout: …) { … }` (the general Nova idiom for
+/// bounding a blocking `Net` operation; see the crate README for a worked
+/// example). Be aware of a caveat found during the audit-review pass (plan
+/// 249, coordinator 2026-08-06): ad hoc loopback testing showed a SECOND
+/// `TcpStream.read()` on a connection (i.e. the peer sent part of a field
+/// then closed, so `read_exact_n` retries) did NOT get interrupted by
+/// `supervised(timeout: …)` in every attempt, even though the SAME
+/// mechanism is regression-tested for a blocked `accept()`
+/// (`std/src/net/supervised_cancel_accept_test.nv:90`, #165). This looks
+/// like an open `std.net`/runtime question, not something this package can
+/// fix — repro: `docs/plans/repro/p249_second_read_after_partial_hangs.nv`
+/// in the `nova` repo. Until it's resolved, a proxy that sends a truncated
+/// field and then goes silent (rather than cleanly closing) may not be
+/// reliably bounded by `timeout:` either.
 #stable(since = "0.1")
 export fn socks5_connect(proxy_host str, proxy_port int, user Option[str], pass Option[str], target_host str, target_port int) Net -> Result[TcpStream, SocksError] {
+    // Validate BEFORE the `as u16` cast below — an out-of-range `int` would
+    // otherwise wrap silently (audit-review pass, plan 249, coordinator
+    // 2026-08-06 — see `check_port`'s own comment).
+    ro proxy_port16 = match check_port(proxy_port) {
+        Ok(p)  => p
+        Err(e) => return Err(e)
+    }
     // NB: `?`/`.map_err()?`/`.ok_or()?` on a `Result[SocketAddr, SocksError]`
     // here hits a P67-LEGACY codegen gap ("Ok type unknown... checker must
     // annotate", compiler-conventions.md §0) — a cross-package generic
     // instantiation gap, not something this package can fix (compiler files
     // are out of scope for this window). Plain `match` avoids it entirely
     // (same class of workaround as std/net/addr.nv's own P67 note).
-    ro addrs = match resolve(proxy_host, proxy_port as u16) {
+    ro addrs = match resolve(proxy_host, proxy_port16) {
         Ok(a)  => a
         Err(e) => return Err(ConnectFailed { reason: "proxy DNS: ${e}" })
     }

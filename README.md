@@ -66,6 +66,37 @@ fn main() Net -> () {
 `user`/`pass` are `Option[str]` — pass `None, None` for an unauthenticated
 proxy.
 
+## Bounding the handshake time
+
+`socks5_connect` has **no built-in timeout** — a caller who needs one wraps
+the call in `supervised(timeout: …)` (the general Nova idiom for bounding a
+blocking `Net` operation):
+
+```nova
+with Fail[TimeoutError] = |_e| { /* handle the timeout */ } {
+    supervised(timeout: 5000.to_millis()) {
+        match socks5_connect("proxy.example.com", 1080, None, None, "example.com", 80) {
+            Ok(consume stream) => { /* use it */ }
+            Err(e) => { /* handshake failed within the deadline */ }
+        }
+    }
+}
+```
+
+**Known caveat, found during a 2026-08-06 audit-review pass (not fixed in
+this package):** ad hoc loopback testing showed that `timeout:` reliably
+interrupts a blocked `TcpListener.accept()` (this is regression-tested —
+`std/src/net/supervised_cancel_accept_test.nv`), but did NOT reliably
+interrupt a SECOND `TcpStream.read()` on a connection where the peer sent
+part of a protocol field and then closed — exactly the retry pattern
+`socks5_connect`'s internal `read_exact_n` uses. This looks like an open
+`std.net`/runtime question, not something fixable from this package —
+minimal repro:
+[`docs/plans/repro/p249_second_read_after_partial_hangs.nv`](https://github.com/nv-lang/nova/blob/main/docs/plans/repro/p249_second_read_after_partial_hangs.nv)
+in the `nova` repo. Until it's resolved, a proxy that sends a truncated
+field and then goes silent (rather than closing cleanly) may hang past your
+`timeout:` deadline.
+
 ## Design
 
 Every handshake message (greeting, method selection, auth request/reply,
