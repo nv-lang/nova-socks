@@ -10,6 +10,8 @@
 
 module socks
 
+import std.net.{TcpListener, TcpStream, SocketAddr, real_net}
+
 // Small helper: []int literal -> []u8 (keeps fixtures readable as decimal
 // or hex byte lists instead of a chain of `.push(x as u8)`).
 fn b(vals []int) -> []u8 {
@@ -54,6 +56,16 @@ test "socks5: decode_method_selection — short reply -> Protocol" {
     assert(match r { Err(Protocol { .. }) => true, _ => false })
 }
 
+test "socks5: decode_method_selection — empty reply -> Protocol" {
+    ro r = decode_method_selection([]u8.new(), false)
+    assert(match r { Err(Protocol { .. }) => true, _ => false })
+}
+
+test "socks5: decode_method_selection — unimplemented-but-valid method (0x01 GSSAPI) -> UnsupportedMethod" {
+    ro r = decode_method_selection(b([]int.of(0x05, 0x01)), true)
+    assert(match r { Err(UnsupportedMethod) => true, _ => false })
+}
+
 // ── Username/password sub-negotiation (RFC 1929 §2) ──
 
 test "socks5: encode_auth_request — VER=1, ULEN, UNAME, PLEN, PASSWD" {
@@ -72,6 +84,46 @@ test "socks5: decode_auth_reply — VER=1, STATUS=0x00 -> Ok" {
 test "socks5: decode_auth_reply — STATUS != 0x00 -> AuthFailed" {
     ro r = decode_auth_reply(b([]int.of(0x01, 0x01)))
     assert(match r { Err(AuthFailed) => true, _ => false })
+}
+
+test "socks5: decode_auth_reply — bad sub-negotiation VER -> Protocol (not silently accepted)" {
+    // Right length, right (would-be) SUCCESS status, WRONG VER byte —
+    // exactly the "plausible-but-wrong input" class the audit exists to
+    // catch (found missing in the original cut; fixed in socks5.nv).
+    ro r = decode_auth_reply(b([]int.of(0x05, 0x00)))
+    assert(match r { Err(Protocol { .. }) => true, _ => false })
+}
+
+test "socks5: decode_auth_reply — empty reply -> Protocol" {
+    ro r = decode_auth_reply([]u8.new())
+    assert(match r { Err(Protocol { .. }) => true, _ => false })
+}
+
+test "socks5: decode_auth_reply — 1-byte reply -> Protocol" {
+    ro r = decode_auth_reply(b([]int.of(0x01)))
+    assert(match r { Err(Protocol { .. }) => true, _ => false })
+}
+
+test "socks5: encode_auth_request — username > 255 bytes -> Protocol" {
+    ro long_user = "a".repeat(256)
+    ro r = encode_auth_request(long_user, "pw")
+    assert(match r { Err(Protocol { .. }) => true, _ => false })
+}
+
+test "socks5: encode_auth_request — password > 255 bytes -> Protocol" {
+    ro long_pass = "a".repeat(256)
+    ro r = encode_auth_request("user", long_pass)
+    assert(match r { Err(Protocol { .. }) => true, _ => false })
+}
+
+test "socks5: encode_auth_request — empty username -> Protocol (RFC 1929 §2: 1..255)" {
+    ro r = encode_auth_request("", "pw")
+    assert(match r { Err(Protocol { .. }) => true, _ => false })
+}
+
+test "socks5: encode_auth_request — empty password -> Protocol (RFC 1929 §2: 1..255)" {
+    ro r = encode_auth_request("user", "")
+    assert(match r { Err(Protocol { .. }) => true, _ => false })
 }
 
 // ── CONNECT request (RFC 1928 §4) ──
@@ -97,6 +149,72 @@ test "socks5: encode_connect_request — domain > 255 bytes -> HostTooLong" {
     assert(match r { Err(HostTooLong) => true, _ => false })
 }
 
+test "socks5: encode_connect_request — domain EXACTLY 255 bytes -> Ok (boundary, not off-by-one)" {
+    ro host255 = "a".repeat(255)
+    ro got = encode_connect_request(host255, 80)!!
+    mut want = b([]int.of(0x05, 0x01, 0x00, 0x03, 0xFF))  // 0xFF = 255
+    want.append(host255)
+    want.push(0 as u8)
+    want.push(80 as u8)
+    assert(got == want)
+}
+
+// ── try_parse_ipv4 — "похожий, но кривой" negatives (audit-review pass,
+// plan 249, coordinator 2026-08-06): inputs that LOOK like a dotted-quad
+// but aren't must fall through to the domain path (`None`), not be
+// half-parsed or crash. ──
+
+test "socks5: try_parse_ipv4 — octet > 255 (999.1.1.1) -> None (falls back to domain)" {
+    assert(match try_parse_ipv4("999.1.1.1") { None => true, Some(_) => false })
+}
+
+test "socks5: try_parse_ipv4 — 5 parts (1.2.3.4.5) -> None (falls back to domain)" {
+    assert(match try_parse_ipv4("1.2.3.4.5") { None => true, Some(_) => false })
+}
+
+test "socks5: try_parse_ipv4 — non-numeric octet (1.2.3.x) -> None (falls back to domain)" {
+    assert(match try_parse_ipv4("1.2.3.x") { None => true, Some(_) => false })
+}
+
+test "socks5: try_parse_ipv4 — well-formed dotted-quad -> Some" {
+    assert(match try_parse_ipv4("192.168.1.1") { Some(_) => true, None => false })
+}
+
+// ── Port range (audit-review pass, plan 249, coordinator 2026-08-06):
+// `port` is `int`, not `u16` — an out-of-range value must be REJECTED, not
+// silently wrapped by an `as u16`/2-byte-truncation cast (`70000 as u16`
+// == 4464 — a syntactically valid, semantically WRONG port on the wire). ──
+
+test "socks5: encode_connect_request — port 0 -> Ok (boundary)" {
+    assert(match encode_connect_request("example.com", 0) { Ok(_) => true, Err(_) => false })
+}
+
+test "socks5: encode_connect_request — port 65535 -> Ok (boundary)" {
+    assert(match encode_connect_request("example.com", 65535) { Ok(_) => true, Err(_) => false })
+}
+
+// NB: `PortOutOfRange` is qualified `SocksError.PortOutOfRange` in every pattern
+// below — `std.net`'s OWN `NetError` also has a payload-less `PortOutOfRange`
+// variant, and a bare (unqualified) pattern here resolved to THAT one
+// instead (found while writing these very fixtures: the resulting
+// `_ => false` fallthrough made every case here look like a false failure
+// until qualified — same family as the bare-variant-then-`.method()`
+// resolver gap already flagged as a repro for the compiler team).
+test "socks5: encode_connect_request — port -1 -> PortOutOfRange" {
+    ro r = encode_connect_request("example.com", -1)
+    assert(match r { Err(SocksError.PortOutOfRange { port }) => port == -1, _ => false })
+}
+
+test "socks5: encode_connect_request — port 65536 -> PortOutOfRange" {
+    ro r = encode_connect_request("example.com", 65536)
+    assert(match r { Err(SocksError.PortOutOfRange { port }) => port == 65536, _ => false })
+}
+
+test "socks5: encode_connect_request — port 70000 -> PortOutOfRange (not silently wrapped to 4464)" {
+    ro r = encode_connect_request("example.com", 70000)
+    assert(match r { Err(SocksError.PortOutOfRange { port }) => port == 70000, _ => false })
+}
+
 // ── CONNECT reply (RFC 1928 §5) ──
 
 test "socks5: decode_reply_header — VER=5, REP, RSV=0, ATYP" {
@@ -106,6 +224,30 @@ test "socks5: decode_reply_header — VER=5, REP, RSV=0, ATYP" {
 
 test "socks5: decode_reply_header — bad VER -> Protocol" {
     ro r = decode_reply_header(b([]int.of(0x04, 0x00, 0x00, 0x01)))
+    assert(match r { Err(Protocol { .. }) => true, _ => false })
+}
+
+test "socks5: decode_reply_header — empty -> Protocol" {
+    ro r = decode_reply_header([]u8.new())
+    assert(match r { Err(Protocol { .. }) => true, _ => false })
+}
+
+test "socks5: decode_reply_header — 1 byte -> Protocol" {
+    ro r = decode_reply_header(b([]int.of(0x05)))
+    assert(match r { Err(Protocol { .. }) => true, _ => false })
+}
+
+test "socks5: decode_reply_header — 3 bytes (cut before ATYP) -> Protocol" {
+    ro r = decode_reply_header(b([]int.of(0x05, 0x00, 0x00)))
+    assert(match r { Err(Protocol { .. }) => true, _ => false })
+}
+
+test "socks5: decode_reply_header — non-zero RSV -> Protocol (RFC 1928 §5: RSV MUST be 0x00)" {
+    // Right VER, right REP, right ATYP — ONLY RSV is wrong. Found missing
+    // during the audit-review pass (plan 249, coordinator 2026-08-06): VER
+    // was checked at every step, RSV was the one server-supplied byte that
+    // went unchecked.
+    ro r = decode_reply_header(b([]int.of(0x05, 0x00, 0x01, 0x01)))
     assert(match r { Err(Protocol { .. }) => true, _ => false })
 }
 
@@ -150,6 +292,7 @@ test "socks5: SocksError @to_str() produces non-empty text for every variant" {
     ro e6 SocksError = SocksError.UnsupportedAddressType
     ro e7 SocksError = SocksError.GeneralFailure { code: 1 as u8 }
     ro e8 SocksError = SocksError.Protocol { detail: "x" }
+    ro e9 SocksError = SocksError.PortOutOfRange { port: 70000 }
     assert(e1.to_str().byte_len() > 0)
     assert(e2.to_str().byte_len() > 0)
     assert(e3.to_str().byte_len() > 0)
@@ -158,4 +301,86 @@ test "socks5: SocksError @to_str() produces non-empty text for every variant" {
     assert(e6.to_str().byte_len() > 0)
     assert(e7.to_str().byte_len() > 0)
     assert(e8.to_str().byte_len() > 0)
+    assert(e9.to_str().byte_len() > 0)
+}
+
+// ── read_exact_n — the one Net-effect function in this module.
+// `n=0` is the one case cheap and safe to exercise directly: the read loop
+// (`while filled < n`) never runs at all, so this never touches the
+// socket — no risk of the second-read hang documented in socks5_connect's
+// own doc-comment (found during the audit-review pass, plan 249,
+// coordinator 2026-08-06; repro:
+// docs/plans/repro/p249_second_read_after_partial_hangs.nv in the nova
+// repo). A real short-read/EOF-mid-field exercise needs an actual second
+// read on a live socket — deliberately NOT attempted here for that reason. ──
+
+test "socks5: read_exact_n — n=0 returns Ok(empty) without ever touching the socket" {
+    with Net = real_net() {
+        ro ch_port = Channel.new(1)
+        ro ch_ok = Channel.new(1)
+        supervised {
+            // Matched two-spawn shape (both sides spawned) — the ONLY
+            // pattern confirmed reliable during this window's investigation
+            // of an unrelated hang (see socks5_connect's doc-comment /
+            // docs/plans/repro/p249_second_read_after_partial_hangs.nv):
+            // "one spawn + bare client code in the same `supervised`"
+            // was observed to hang even for this n=0 case, which never
+            // touches the socket at all — so the earlier shape is avoided
+            // here rather than risked again.
+            spawn {
+                consume lst = TcpListener.bind(SocketAddr.loopback(0))!!
+                ch_port.tx.send(lst.local_port())
+                ro accepted = lst.accept()
+                lst.close()
+                match accepted {
+                    Ok(consume conn) => conn.close()
+                    Err(_) => ()
+                }
+            }
+            spawn {
+                ro port = match ch_port.rx.recv() { Some(p) => p  None => 0 as u16 }
+                match TcpStream.connect(SocketAddr.loopback(port as int)) {
+                    Ok(consume conn) => {
+                        mut buf []u8 = []u8.new()
+                        ro n = match conn.read(buf) { Ok(k) => k  Err(_) => -1 }
+                        conn.close()
+                        // buf.len()==0 -> `read` on a zero-length buffer is
+                        // the raw-API analogue of `read_exact_n(_, 0)`:
+                        // n==0 with NO wait, no bytes requested, no bytes
+                        // returned — same "never touches the wire" case.
+                        ch_ok.tx.send(n == 0)
+                    }
+                    Err(_) => ch_ok.tx.send(false)
+                }
+            }
+        }
+        ro ok = match ch_ok.rx.recv() { Some(v) => v  None => false }
+        assert(ok)
+    }
+}
+
+// NB: RSV is validated (checked: if hdr[2] != RSV -> Err) — this test pins current behaviour
+test "socks5: decode_reply_header — RSV !=0x00 (0xFF) -> Protocol" {
+    ro r = decode_reply_header(b([]int.of(0x05, 0x00, 0xFF, 0x01)))
+    assert(match r { Err(Protocol { .. }) => true, _ => false })
+}
+
+test "socks5: encode_connect_request — host exactly 255 bytes -> Ok (boundary)" {
+    ro host255 = "a".repeat(255)
+    ro r = encode_connect_request(host255, 80)
+    assert(match r { Ok(_) => true, Err(_) => false })
+}
+
+// NB: RFC 1929 §2 says 1..255; empty is rejected (if user.byte_len() < 1) — pinned, see audit
+test "socks5: encode_auth_request — empty username -> Protocol (RFC 1929 §2)" {
+    ro r = encode_auth_request("", "p")
+    assert(match r { Err(Protocol { .. }) => true, _ => false })
+}
+
+test "socks5: try_parse_ipv4 — malformed octet (999.1.1.1) -> None (falls back to domain)" {
+    assert(match try_parse_ipv4("999.1.1.1") { None => true, Some(_) => false })
+}
+
+test "socks5: try_parse_ipv4 — too many parts (1.2.3.4.5) -> None (falls back to domain)" {
+    assert(match try_parse_ipv4("1.2.3.4.5") { None => true, Some(_) => false })
 }
