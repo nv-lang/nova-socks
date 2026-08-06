@@ -351,10 +351,8 @@ export fn socks5_connect(proxy_host str, proxy_port int, user Option[str], pass 
         Some(a) => a
         None    => return Err(ConnectFailed { reason: "proxy host resolved to no addresses" })
     }
-    consume stream = match TcpStream.connect(addr) {
-        Ok(consume s) => s
-        Err(e)        => return Err(ConnectFailed { reason: e.to_str() })
-    }
+    consume stream = TcpStream.connect(addr)
+        .map_err(|e| ConnectFailed { reason: e.to_str() })?
     // Scope-block (D188/consume-scope-cleanup): owns `stream` for the whole
     // handshake — every `return Err(...)` below auto-closes it via
     // `Cleanup[never]` (tcp.nv's `consume @cleanup` -> `@close()`), exactly
