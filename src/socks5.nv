@@ -87,14 +87,12 @@ type SelectedMethod enum NoAuth | UserPass
 /// advertises both no-auth (`0x00`) and username/password (`0x02`) — the
 /// caller's `user`/`pass` decide, at the auth sub-negotiation step, whether
 /// a `0x02` selection is actually usable ([`decode_method_selection`]).
-fn encode_greeting() -> []u8 {
-    mut out []u8 = []u8.new()
-    out.push(VERSION)
-    out.push(2 as u8)
-    out.push(METHOD_NO_AUTH)
-    out.push(METHOD_USER_PASS)
-    out
-}
+fn encode_greeting() -> []u8 =>
+    []u8.new()
+        .push(VERSION)
+        .push(2 as u8)
+        .push(METHOD_NO_AUTH)
+        .push(METHOD_USER_PASS)
 
 /// Decode the server's method-selection reply: `VER(1) METHOD(1)`.
 /// `have_creds` — whether the caller supplied both username and password
@@ -128,13 +126,12 @@ fn encode_auth_request(user str, pass str) -> Result[[]u8, SocksError] {
     if pass.byte_len() > 255 {
         return Err(Protocol { detail: "SOCKS5 auth password exceeds the 255-byte limit" })
     }
-    mut out []u8 = []u8.new()
-    out.push(AUTH_VERSION)
-    out.push(user.byte_len() as u8)
-    out.append(user.bytes())
-    out.push(pass.byte_len() as u8)
-    out.append(pass.bytes())
-    Ok(out)
+    Ok([]u8.new()
+        .push(AUTH_VERSION)
+        .push(user.byte_len() as u8)
+        .append(user.bytes())
+        .push(pass.byte_len() as u8)
+        .append(pass.bytes()))
 }
 
 /// Auth reply: `VER(1) STATUS(1)`. `STATUS != 0x00` → failure.
