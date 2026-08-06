@@ -351,8 +351,14 @@ export fn socks5_connect(proxy_host str, proxy_port int, user Option[str], pass 
         Some(a) => a
         None    => return Err(ConnectFailed { reason: "proxy host resolved to no addresses" })
     }
-    consume stream = TcpStream.connect(addr)
-        .map_err(|e| ConnectFailed { reason: e.to_str() })?
+    // NB: короткая форма `.map_err(|e| …)?` здесь НЕ работает — №394: смена
+    // типа ошибки не доезжает до кодогена (check молчит, C падает
+    // «passing 'nova_str' to parameter of incompatible type
+    // 'Nova_SocksError *'»). Вернуть форму владельца после фикса №394.
+    consume stream = match TcpStream.connect(addr) {
+        Ok(consume s) => s
+        Err(e)        => return Err(ConnectFailed { reason: e.to_str() })
+    }
     // Scope-block (D188/consume-scope-cleanup): owns `stream` for the whole
     // handshake — every `return Err(...)` below auto-closes it via
     // `Cleanup[never]` (tcp.nv's `consume @cleanup` -> `@close()`), exactly
