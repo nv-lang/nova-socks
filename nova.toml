@@ -1,0 +1,24 @@
+# nova.toml — nova-socks: SOCKS5 client (RFC 1928, username/password auth
+# RFC 1929) for Nova, CONNECT command only.
+#
+# Layout: src/ canon. Source root is set via the `[lib] src` key
+# (compiler-codegen/src/manifest.rs) so module paths resolve relative to
+# `src/` (D78 — module path does NOT include `src`). This package's whole
+# surface is root peers: `src/socks5.nv` -> `module socks` (D78 external-
+# package naming, mirroring nova-compress's `std.encoding.compress` ->
+# `compress` and nova-tls's `std.tls` -> `tls`).
+#
+# No [ffi] section: SOCKS5 is a pure byte-level protocol implemented over
+# std.net's `Net` effect — zero native code, zero C shim, zero vendored
+# source (unlike nova-compress/nova-tls, which wrap a native decoder/TLS
+# library). Plan 249 §3.1.
+
+[package]
+name = "socks"
+version = "0.1.0"
+description = "SOCKS5 client (RFC 1928, username/password auth RFC 1929) for Nova — CONNECT command over std.net, pure Nova, no native dependencies"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/nv-lang/nova-socks"
+
+[lib]
+src = "src"
