@@ -129,9 +129,9 @@ fn encode_auth_request(user str, pass str) -> Result[[]u8, SocksError] {
     Ok([]u8.new()
         .push(AUTH_VERSION)
         .push(user.byte_len() as u8)
-        .append(user)
+        .append(user.bytes())
         .push(pass.byte_len() as u8)
-        .append(pass))
+        .append(pass.bytes()))
 }
 
 /// Auth reply: `VER(1) STATUS(1)`. `STATUS != 0x00` → failure.
