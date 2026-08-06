@@ -1,0 +1,161 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// src/socks5_test.nv — byte fixtures for the pure SOCKS5 encode/decode
+// functions (peer of socks5.nv, same module). Every handshake step gets its
+// own fixture, sourced from RFC 1928/1929 wire layouts (not from memory —
+// see socks5.nv's module doc), plus the negatives plan 249 §3.1 requires:
+// server picks 0xFF -> UnsupportedMethod, auth failure -> AuthFailed, ATYP
+// 0x04 -> UnsupportedAddressType, domain > 255 bytes -> HostTooLong, REP !=
+// 0x00 -> GeneralFailure. No SOCKS5 server needed — every case here is a
+// pure function over `[]u8`.
+
+module socks
+
+// Small helper: []int literal -> []u8 (keeps fixtures readable as decimal
+// or hex byte lists instead of a chain of `.push(x as u8)`).
+fn b(vals []int) -> []u8 {
+    mut out []u8 = []u8.new()
+    for v in vals { out.push(v as u8) }
+    out
+}
+
+// ── Method negotiation (RFC 1928 §3) ──
+
+test "socks5: encode_greeting — VER=5, NMETHODS=2, [NO_AUTH, USER_PASS]" {
+    assert(encode_greeting() == b([]int.of(0x05, 0x02, 0x00, 0x02)))
+}
+
+test "socks5: decode_method_selection — server picks NO_AUTH" {
+    ro r = decode_method_selection(b([]int.of(0x05, 0x00)), false)
+    assert(match r { Ok(NoAuth) => true, _ => false })
+}
+
+test "socks5: decode_method_selection — server picks USER_PASS, creds given" {
+    ro r = decode_method_selection(b([]int.of(0x05, 0x02)), true)
+    assert(match r { Ok(UserPass) => true, _ => false })
+}
+
+test "socks5: decode_method_selection — server picks USER_PASS, no creds -> AuthRequired" {
+    ro r = decode_method_selection(b([]int.of(0x05, 0x02)), false)
+    assert(match r { Err(AuthRequired) => true, _ => false })
+}
+
+test "socks5: decode_method_selection — server picks 0xFF -> UnsupportedMethod" {
+    ro r = decode_method_selection(b([]int.of(0x05, 0xFF)), true)
+    assert(match r { Err(UnsupportedMethod) => true, _ => false })
+}
+
+test "socks5: decode_method_selection — bad VER in reply -> Protocol" {
+    ro r = decode_method_selection(b([]int.of(0x04, 0x00)), false)
+    assert(match r { Err(Protocol { .. }) => true, _ => false })
+}
+
+test "socks5: decode_method_selection — short reply -> Protocol" {
+    ro r = decode_method_selection(b([]int.of(0x05)), false)
+    assert(match r { Err(Protocol { .. }) => true, _ => false })
+}
+
+// ── Username/password sub-negotiation (RFC 1929 §2) ──
+
+test "socks5: encode_auth_request — VER=1, ULEN, UNAME, PLEN, PASSWD" {
+    ro got = encode_auth_request("alice", "s3cret")!!
+    mut want = b([]int.of(0x01, 5))
+    want.append("alice")
+    want.push(6 as u8)
+    want.append("s3cret")
+    assert(got == want)
+}
+
+test "socks5: decode_auth_reply — VER=1, STATUS=0x00 -> Ok" {
+    assert(match decode_auth_reply(b([]int.of(0x01, 0x00))) { Ok(_) => true, Err(_) => false })
+}
+
+test "socks5: decode_auth_reply — STATUS != 0x00 -> AuthFailed" {
+    ro r = decode_auth_reply(b([]int.of(0x01, 0x01)))
+    assert(match r { Err(AuthFailed) => true, _ => false })
+}
+
+// ── CONNECT request (RFC 1928 §4) ──
+
+test "socks5: encode_connect_request — IPv4 literal target -> ATYP 0x01" {
+    ro got = encode_connect_request("93.184.216.34", 443)!!
+    ro want = b([]int.of(0x05, 0x01, 0x00, 0x01, 93, 184, 216, 34, 0x01, 0xBB))
+    assert(got == want)
+}
+
+test "socks5: encode_connect_request — domain target -> ATYP 0x03, length-prefixed" {
+    ro got = encode_connect_request("example.com", 80)!!
+    mut want = b([]int.of(0x05, 0x01, 0x00, 0x03, 11))
+    want.append("example.com")
+    want.push(0 as u8)
+    want.push(80 as u8)
+    assert(got == want)
+}
+
+test "socks5: encode_connect_request — domain > 255 bytes -> HostTooLong" {
+    ro long_host = "a".repeat(256)
+    ro r = encode_connect_request(long_host, 80)
+    assert(match r { Err(HostTooLong) => true, _ => false })
+}
+
+// ── CONNECT reply (RFC 1928 §5) ──
+
+test "socks5: decode_reply_header — VER=5, REP, RSV=0, ATYP" {
+    ro r = decode_reply_header(b([]int.of(0x05, 0x00, 0x00, 0x01)))
+    assert(match r { Ok((rep, atyp)) => rep == (0 as u8) && atyp == (1 as u8), Err(_) => false })
+}
+
+test "socks5: decode_reply_header — bad VER -> Protocol" {
+    ro r = decode_reply_header(b([]int.of(0x04, 0x00, 0x00, 0x01)))
+    assert(match r { Err(Protocol { .. }) => true, _ => false })
+}
+
+test "socks5: classify_atyp — 0x01 (IPv4) -> Fixed(4)" {
+    assert(match classify_atyp(0x01 as u8) { Ok(Fixed(4)) => true, _ => false })
+}
+
+test "socks5: classify_atyp — 0x03 (domain) -> LengthPrefixed" {
+    assert(match classify_atyp(0x03 as u8) { Ok(LengthPrefixed) => true, _ => false })
+}
+
+test "socks5: classify_atyp — 0x04 (IPv6) -> UnsupportedAddressType (owner-approved V1 boundary, plan 249 §7)" {
+    assert(match classify_atyp(0x04 as u8) { Err(UnsupportedAddressType) => true, _ => false })
+}
+
+test "socks5: classify_atyp — unknown ATYP -> Protocol" {
+    assert(match classify_atyp(0x99 as u8) { Err(Protocol { .. }) => true, _ => false })
+}
+
+test "socks5: decode_connect_reply — REP=0x00 -> Ok" {
+    assert(match decode_connect_reply(0x00 as u8) { Ok(_) => true, Err(_) => false })
+}
+
+test "socks5: decode_connect_reply — REP != 0x00 -> GeneralFailure { code }" {
+    ro r = decode_connect_reply(0x05 as u8)
+    assert(match r { Err(GeneralFailure { code }) => code == (5 as u8), _ => false })
+}
+
+// ── SocksError @to_str() — sanity, not a wire fixture ──
+
+test "socks5: SocksError @to_str() produces non-empty text for every variant" {
+    // Explicit `SocksError`-typed locals (not a bare-variant-then-chain) —
+    // a payload-less variant identifier immediately followed by `.method()`
+    // resolves oddly (codegen picked a stray same-named free function
+    // instead of dispatching `SocksError @to_str()`); binding first avoids
+    // the ambiguity.
+    ro e1 SocksError = SocksError.ConnectFailed { reason: "x" }
+    ro e2 SocksError = SocksError.AuthFailed
+    ro e3 SocksError = SocksError.AuthRequired
+    ro e4 SocksError = SocksError.UnsupportedMethod
+    ro e5 SocksError = SocksError.HostTooLong
+    ro e6 SocksError = SocksError.UnsupportedAddressType
+    ro e7 SocksError = SocksError.GeneralFailure { code: 1 as u8 }
+    ro e8 SocksError = SocksError.Protocol { detail: "x" }
+    assert(e1.to_str().byte_len() > 0)
+    assert(e2.to_str().byte_len() > 0)
+    assert(e3.to_str().byte_len() > 0)
+    assert(e4.to_str().byte_len() > 0)
+    assert(e5.to_str().byte_len() > 0)
+    assert(e6.to_str().byte_len() > 0)
+    assert(e7.to_str().byte_len() > 0)
+    assert(e8.to_str().byte_len() > 0)
+}

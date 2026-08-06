@@ -1,0 +1,360 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// src/socks5.nv — SOCKS5 client (RFC 1928), CONNECT command, with
+// username/password sub-negotiation (RFC 1929).
+//
+// Scope (plan 249 §7, owner-approved 2026-08-06): CONNECT only; target
+// addresses are IPv4 literal or domain name — ATYP 0x04 (IPv6) is a typed
+// `Err(UnsupportedAddressType)`, not a silently-wrong decode. No SOCKS5
+// server, no SOCKS4/4a, no GSSAPI (RFC 1961), no UDP ASSOCIATE.
+//
+// Structure (plan 249 §3.1 — testability by construction): every handshake
+// message is a PURE encode/decode function over `[]u8` (no `Net` effect),
+// exercised directly by byte fixtures in the peer `socks5_test.nv` — no
+// SOCKS5 server needed for tests. `socks5_connect` is the thin `Net`
+// wrapper: read N bytes -> decode -> encode -> write N bytes.
+//
+// Byte layout below is transcribed FROM the RFC text (plan 249 risk
+// register — easy to get field order wrong from memory), not from memory:
+//   RFC 1928 — SOCKS Protocol Version 5
+//   RFC 1929 — Username/Password Authentication for SOCKS V5
+
+module socks
+
+import std.net.{TcpStream, resolve}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Error surface
+// ─────────────────────────────────────────────────────────────────────────
+
+/// SOCKS5 client error surface (D30: one structural error type per domain).
+#stable(since = "0.1")
+export type SocksError enum ConnectFailed { reason str }
+    | AuthFailed
+    | AuthRequired
+    | UnsupportedMethod
+    | HostTooLong
+    | UnsupportedAddressType
+    | GeneralFailure { code u8 }
+    | Protocol { detail str }
+
+/// Human-readable description (no trailing newline).
+#stable(since = "0.1")
+export fn SocksError @to_str() -> str {
+    match @ {
+        ConnectFailed { reason } => "connect to SOCKS5 proxy failed: ${reason}"
+        AuthFailed                => "SOCKS5 username/password authentication failed"
+        AuthRequired               => "SOCKS5 server requires authentication, but no credentials were given"
+        UnsupportedMethod          => "SOCKS5 server accepted none of the offered authentication methods"
+        HostTooLong                => "target hostname exceeds the SOCKS5 255-byte domain-name limit"
+        UnsupportedAddressType     => "SOCKS5 server returned an IPv6 (ATYP 0x04) address — not supported"
+        GeneralFailure { code }    => "SOCKS5 CONNECT failed, server reply code ${code}"
+        Protocol { detail }        => "SOCKS5 protocol error: ${detail}"
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Wire constants (RFC 1928 §3-5, RFC 1929 §2)
+// ─────────────────────────────────────────────────────────────────────────
+
+const VERSION u8 = 0x05
+
+const METHOD_NO_AUTH       u8 = 0x00
+const METHOD_USER_PASS     u8 = 0x02
+const METHOD_NO_ACCEPTABLE u8 = 0xFF
+
+const AUTH_VERSION u8 = 0x01
+const AUTH_SUCCESS u8 = 0x00
+
+const CMD_CONNECT u8 = 0x01
+const RSV         u8 = 0x00
+
+const ATYP_IPV4   u8 = 0x01
+const ATYP_DOMAIN u8 = 0x03
+const ATYP_IPV6   u8 = 0x04
+
+const REP_SUCCEEDED u8 = 0x00
+
+const MAX_DOMAIN_LEN = 255
+
+// ─────────────────────────────────────────────────────────────────────────
+// Pure encode/decode — method negotiation (RFC 1928 §3)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Which authentication method the server picked.
+type SelectedMethod enum NoAuth | UserPass
+
+/// Client greeting: `VER(1) NMETHODS(1) METHODS(NMETHODS)`. Always
+/// advertises both no-auth (`0x00`) and username/password (`0x02`) — the
+/// caller's `user`/`pass` decide, at the auth sub-negotiation step, whether
+/// a `0x02` selection is actually usable ([`decode_method_selection`]).
+fn encode_greeting() -> []u8 {
+    mut out []u8 = []u8.new()
+    out.push(VERSION)
+    out.push(2 as u8)
+    out.push(METHOD_NO_AUTH)
+    out.push(METHOD_USER_PASS)
+    out
+}
+
+/// Decode the server's method-selection reply: `VER(1) METHOD(1)`.
+/// `have_creds` — whether the caller supplied both username and password
+/// (decides whether a `0x02` selection is actually usable).
+fn decode_method_selection(resp []u8, have_creds bool) -> Result[SelectedMethod, SocksError] {
+    if resp.len() != 2 {
+        return Err(Protocol { detail: "method-selection reply must be exactly 2 bytes" })
+    }
+    if resp[0] != VERSION {
+        return Err(Protocol { detail: "unexpected SOCKS version in method-selection reply" })
+    }
+    ro method = resp[1]
+    if method == METHOD_NO_ACCEPTABLE { return Err(UnsupportedMethod) }
+    if method == METHOD_NO_AUTH { return Ok(NoAuth) }
+    if method == METHOD_USER_PASS {
+        if have_creds { return Ok(UserPass) }
+        return Err(AuthRequired)
+    }
+    Err(UnsupportedMethod)
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Pure encode/decode — username/password sub-negotiation (RFC 1929 §2)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Auth request: `VER(1)=0x01 ULEN(1) UNAME(ULEN) PLEN(1) PASSWD(PLEN)`.
+fn encode_auth_request(user str, pass str) -> Result[[]u8, SocksError] {
+    if user.byte_len() > 255 {
+        return Err(Protocol { detail: "SOCKS5 auth username exceeds the 255-byte limit" })
+    }
+    if pass.byte_len() > 255 {
+        return Err(Protocol { detail: "SOCKS5 auth password exceeds the 255-byte limit" })
+    }
+    mut out []u8 = []u8.new()
+    out.push(AUTH_VERSION)
+    out.push(user.byte_len() as u8)
+    out.append(user.bytes())
+    out.push(pass.byte_len() as u8)
+    out.append(pass.bytes())
+    Ok(out)
+}
+
+/// Auth reply: `VER(1) STATUS(1)`. `STATUS != 0x00` → failure.
+fn decode_auth_reply(resp []u8) -> Result[(), SocksError] {
+    if resp.len() != 2 {
+        return Err(Protocol { detail: "auth reply must be exactly 2 bytes" })
+    }
+    if resp[1] != AUTH_SUCCESS { return Err(AuthFailed) }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Pure encode/decode — CONNECT (RFC 1928 §4-5)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// CONNECT request:
+/// `VER(1) CMD(1)=0x01 RSV(1)=0x00 ATYP(1) DST.ADDR(var) DST.PORT(2, big-endian)`.
+///
+/// `host` chooses `ATYP`: a dotted-quad IPv4 literal encodes as `0x01` (4
+/// raw bytes); anything else encodes as `0x03` (domain name, 1-byte length
+/// prefix + bytes) — letting the PROXY resolve the name, the common and
+/// most compatible choice (mirrors Go `x/net/proxy`, curl). IPv6 target
+/// literals are NOT detected/encoded (V1 scope, plan 249 §7) — they fall
+/// through to the domain-name path, where the proxy's own resolver will
+/// fail them; this is a known V1 limitation, not a silent miscode.
+fn encode_connect_request(host str, port int) -> Result[[]u8, SocksError] {
+    mut out []u8 = []u8.new()
+    out.push(VERSION)
+    out.push(CMD_CONNECT)
+    out.push(RSV)
+    match try_parse_ipv4(host) {
+        Some((a, b, c, d)) => {
+            out.push(ATYP_IPV4)
+            out.push(a)
+            out.push(b)
+            out.push(c)
+            out.push(d)
+        }
+        None => {
+            if host.byte_len() > MAX_DOMAIN_LEN { return Err(HostTooLong) }
+            out.push(ATYP_DOMAIN)
+            out.push(host.byte_len() as u8)
+            out.append(host.bytes())
+        }
+    }
+    out.push(((port >> 8) & 0xFF) as u8)
+    out.push((port & 0xFF) as u8)
+    Ok(out)
+}
+
+// Best-effort dotted-quad IPv4 literal detector — decides ATYP for the
+// CONNECT request (see [`encode_connect_request`]). Not a general-purpose
+// IPv4 parser: any 4-part, all-numeric 0..255 string round-trips; anything
+// else (including malformed IPv4-*looking* text) falls back to the domain
+// path, which is a harmless (if slightly wasteful) degrade — the proxy's
+// own resolver fails it with a normal `GeneralFailure`, not a miscode here.
+fn try_parse_ipv4(host str) -> Option[(u8, u8, u8, u8)] {
+    ro parts []str = host.split(".").collect()
+    if parts.len() != 4 { return None }
+    mut octets []u8 = []u8.new()
+    for i in 0..4 {
+        // [M-174.1-vec-method-chain-elem-erasure]: explicit `str` local
+        // before the method call — chaining `.to_int()` straight off
+        // `parts[i]` erases the element type (same known gap as
+        // std/net/addr.nv's `@ip`/`@to_str`).
+        ro part str = parts[i]
+        match part.to_int() {
+            Ok(n) => {
+                if n < 0 || n > 255 { return None }
+                octets.push(n as u8)
+            }
+            Err(_) => return None
+        }
+    }
+    Some((octets[0], octets[1], octets[2], octets[3]))
+}
+
+/// Fixed 4-byte reply header: `VER(1) REP(1) RSV(1) ATYP(1)`. Returns
+/// `(REP, ATYP)` — the address+port tail is variable-length and handled
+/// separately (see [`classify_atyp`]).
+fn decode_reply_header(hdr []u8) -> Result[(u8, u8), SocksError] {
+    if hdr.len() != 4 {
+        return Err(Protocol { detail: "CONNECT reply header must be exactly 4 bytes" })
+    }
+    if hdr[0] != VERSION {
+        return Err(Protocol { detail: "unexpected SOCKS version in CONNECT reply" })
+    }
+    Ok((hdr[1], hdr[3]))
+}
+
+/// How to read the reply's `BND.ADDR` tail, given its `ATYP` byte.
+type AddrTail enum Fixed(int) | LengthPrefixed
+
+/// Classify `ATYP` from a CONNECT reply. `0x04` (IPv6) is a typed
+/// `Err(UnsupportedAddressType)` — the owner-approved V1 boundary (plan 249
+/// §7): an honest refusal, not a half-decode.
+fn classify_atyp(atyp u8) -> Result[AddrTail, SocksError] {
+    if atyp == ATYP_IPV4 { return Ok(Fixed(4)) }
+    if atyp == ATYP_DOMAIN { return Ok(LengthPrefixed) }
+    if atyp == ATYP_IPV6 { return Err(UnsupportedAddressType) }
+    Err(Protocol { detail: "unknown ATYP ${atyp} in CONNECT reply" })
+}
+
+/// Interpret `REP`: `0x00` = succeeded, anything else = the server's own
+/// failure code (D30-conventions: carry the code, don't re-guess its
+/// meaning).
+fn decode_connect_reply(rep u8) -> Result[(), SocksError] {
+    if rep == REP_SUCCEEDED { Ok(()) } else { Err(GeneralFailure { code: rep }) }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Net wrapper — the only effectful surface in this module
+// ─────────────────────────────────────────────────────────────────────────
+
+// Read exactly `n` bytes (protocol fields have an EXACT length — unlike
+// `TcpStream @read_bytes(max)`'s "up to max" semantics). Loops over short
+// reads; `Ok(0)` mid-read is a protocol violation (proxy hung up early),
+// not silent truncation.
+fn read_exact_n(mut stream TcpStream, n int) Net -> Result[[]u8, SocksError] {
+    mut out []u8 = []u8.new()
+    out.resize(n, 0 as u8)
+    mut filled = 0
+    mut chunk []u8 = []u8.new()
+    chunk.resize(n, 0 as u8)
+    while filled < n {
+        match stream.read(chunk) {
+            Ok(0) => return Err(Protocol { detail: "unexpected EOF from SOCKS5 proxy" })
+            Ok(k) => {
+                for i in 0..k { out[filled + i] = chunk[i] }
+                filled += k
+                chunk.resize(n - filled, 0 as u8)
+            }
+            Err(e) => return Err(ConnectFailed { reason: e.to_str() })
+        }
+    }
+    Ok(out)
+}
+
+/// Connect to `target_host:target_port` through a SOCKS5 proxy at
+/// `proxy_host:proxy_port`, with optional username/password auth
+/// (RFC 1929). On success, the returned `TcpStream` is a live, fully
+/// established tunnel — read/write it exactly like a direct connection.
+///
+/// See the module doc for scope: CONNECT only, IPv4/domain targets
+/// (`Err(UnsupportedAddressType)` if the server's reply address is IPv6).
+#stable(since = "0.1")
+export fn socks5_connect(proxy_host str, proxy_port int, user Option[str], pass Option[str], target_host str, target_port int) Net -> Result[TcpStream, SocksError] {
+    // NB: `?`/`.map_err()?`/`.ok_or()?` on a `Result[SocketAddr, SocksError]`
+    // here hits a P67-LEGACY codegen gap ("Ok type unknown... checker must
+    // annotate", compiler-conventions.md §0) — a cross-package generic
+    // instantiation gap, not something this package can fix (compiler files
+    // are out of scope for this window). Plain `match` avoids it entirely
+    // (same class of workaround as std/net/addr.nv's own P67 note).
+    ro addrs = match resolve(proxy_host, proxy_port as u16) {
+        Ok(a)  => a
+        Err(e) => return Err(ConnectFailed { reason: "proxy DNS: ${e}" })
+    }
+    ro addr = match addrs.get(0) {
+        Some(a) => a
+        None    => return Err(ConnectFailed { reason: "proxy host resolved to no addresses" })
+    }
+    consume stream = match TcpStream.connect(addr) {
+        Ok(consume s) => s
+        Err(e)        => return Err(ConnectFailed { reason: e.to_str() })
+    }
+    // Scope-block (D188/consume-scope-cleanup): owns `stream` for the whole
+    // handshake — every `return Err(...)` below auto-closes it via
+    // `Cleanup[never]` (tcp.nv's `consume @cleanup` -> `@close()`), exactly
+    // once, no manual `stream.close()` needed. The single success exit,
+    // `return Ok(stream)`, moves the value out and disarms the auto-close
+    // for that path (mirrors nova-tls's `TlsStream.connect`).
+    consume stream {
+        // ── Method negotiation (RFC 1928 §3) ──
+        match stream.write_all(encode_greeting()) {
+            Ok(_)  => ()
+            Err(e) => return Err(ConnectFailed { reason: e.to_str() })
+        }
+        ro have_creds = match (user, pass) { (Some(_), Some(_)) => true, _ => false }
+        ro greeting_reply = read_exact_n(stream, 2)?
+        ro method = decode_method_selection(greeting_reply, have_creds)?
+
+        // ── Username/password sub-negotiation (RFC 1929 §2), if selected ──
+        match method {
+            UserPass => {
+                ro u = user ?? ""
+                ro p = pass ?? ""
+                ro auth_req = encode_auth_request(u, p)?
+                match stream.write_all(auth_req) {
+                    Ok(_)  => ()
+                    Err(e) => return Err(ConnectFailed { reason: e.to_str() })
+                }
+                ro auth_reply = read_exact_n(stream, 2)?
+                decode_auth_reply(auth_reply)?
+            }
+            NoAuth => ()
+        }
+
+        // ── CONNECT request (RFC 1928 §4) ──
+        ro connect_req = encode_connect_request(target_host, target_port)?
+        match stream.write_all(connect_req) {
+            Ok(_)  => ()
+            Err(e) => return Err(ConnectFailed { reason: e.to_str() })
+        }
+
+        // ── CONNECT reply (RFC 1928 §5) ──
+        ro hdr = read_exact_n(stream, 4)?
+        ro (rep, atyp) = decode_reply_header(hdr)?
+        // Drain BND.ADDR + BND.PORT regardless of REP so the stream is left
+        // clean for the caller — the reply tail is fully formed on the wire
+        // even when CONNECT failed (RFC 1928 §5).
+        ro tail = classify_atyp(atyp)?
+        match tail {
+            Fixed(len) => { read_exact_n(stream, len)? }
+            LengthPrefixed => {
+                ro len_byte = read_exact_n(stream, 1)?
+                read_exact_n(stream, len_byte[0] as int)?
+            }
+        }
+        read_exact_n(stream, 2)?   // BND.PORT
+        decode_connect_reply(rep)?
+        return Ok(stream)
+    }
+}
