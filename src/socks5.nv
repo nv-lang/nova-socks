@@ -347,10 +347,10 @@ export fn socks5_connect(proxy_host str, proxy_port int, user Option[str], pass 
         Ok(a)  => a
         Err(e) => return Err(ConnectFailed { reason: "proxy DNS: ${e}" })
     }
-    ro addr = match addrs.get(0) {
-        Some(a) => a
-        None    => return Err(ConnectFailed { reason: "proxy host resolved to no addresses" })
+    if addrs.len() == 0 {
+        return Err(ConnectFailed { reason: "proxy host resolved to no addresses" })
     }
+    ro addr = addrs[0]
     // NB: короткая форма `.map_err(|e| …)?` здесь НЕ работает — №394: смена
     // типа ошибки не доезжает до кодогена (check молчит, C падает
     // «passing 'nova_str' to parameter of incompatible type
