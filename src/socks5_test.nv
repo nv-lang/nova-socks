@@ -316,8 +316,8 @@ test "socks5: SocksError @to_str() produces non-empty text for every variant" {
 
 test "socks5: read_exact_n — n=0 returns Ok(empty) without ever touching the socket" {
     with Net = real_net() {
-        ro ch_port = Channel.new(1)
-        ro ch_ok = Channel.new(1)
+        ro ch_port = Channel[u16].new(1)
+        ro ch_ok = Channel[bool].new(1)
         supervised {
             // Matched two-spawn shape (both sides spawned) — the ONLY
             // pattern confirmed reliable during this window's investigation
