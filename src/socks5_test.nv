@@ -338,11 +338,11 @@ test "socks5: read_exact_n — n=0 returns Ok(empty) without ever touching the s
                 }
             }
             spawn {
-                ro port = match ch_port.rx.recv() { Some(p) => p  None => 0 as u16 }
+                ro port = match ch_port.rx.recv() { Some(p) => p, None => 0 as u16 }
                 match TcpStream.connect(SocketAddr.loopback(port as int)) {
                     Ok(consume conn) => {
                         mut buf []u8 = []u8.new()
-                        ro n = match conn.read(buf) { Ok(k) => k  Err(_) => -1 }
+                        ro n = match conn.read(buf) { Ok(k) => k, Err(_) => -1 }
                         conn.close()
                         // buf.len()==0 -> `read` on a zero-length buffer is
                         // the raw-API analogue of `read_exact_n(_, 0)`:
@@ -354,7 +354,7 @@ test "socks5: read_exact_n — n=0 returns Ok(empty) without ever touching the s
                 }
             }
         }
-        ro ok = match ch_ok.rx.recv() { Some(v) => v  None => false }
+        ro ok = match ch_ok.rx.recv() { Some(v) => v, None => false }
         assert(ok)
     }
 }
