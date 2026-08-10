@@ -15,7 +15,7 @@
 
 [package]
 name = "socks"
-version = "0.1.1"
+version = "0.1.2"
 description = "SOCKS5 client (RFC 1928, username/password auth RFC 1929) for Nova — CONNECT command over std.net, pure Nova, no native dependencies"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/nv-lang/nova-socks"
